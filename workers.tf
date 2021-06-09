@@ -7,8 +7,7 @@ resource "aws_autoscaling_group" "workers" {
     compact(
       [
         coalescelist(aws_eks_cluster.this[*].name, [""])[0],
-        lookup(var.worker_groups[count.index], "name", count.index),
-        lookup(var.worker_groups[count.index], "asg_recreate_on_change", local.workers_group_defaults["asg_recreate_on_change"]) ? random_pet.workers[count.index].id : ""
+        lookup(var.worker_groups[count.index], "name", count.index)
       ]
     )
   )
@@ -88,10 +87,20 @@ resource "aws_autoscaling_group" "workers" {
     "default_cooldown",
     local.workers_group_defaults["default_cooldown"]
   )
+  health_check_type = lookup(
+    var.worker_groups[count.index],
+    "health_check_type",
+    local.workers_group_defaults["health_check_type"]
+  )
   health_check_grace_period = lookup(
     var.worker_groups[count.index],
     "health_check_grace_period",
     local.workers_group_defaults["health_check_grace_period"]
+  )
+  capacity_rebalance = lookup(
+    var.worker_groups[count.index],
+    "capacity_rebalance",
+    local.workers_group_defaults["capacity_rebalance"]
   )
 
   dynamic "initial_lifecycle_hook" {
@@ -104,6 +113,16 @@ resource "aws_autoscaling_group" "workers" {
       notification_target_arn = lookup(initial_lifecycle_hook.value, "notification_target_arn", null)
       role_arn                = lookup(initial_lifecycle_hook.value, "role_arn", null)
       default_result          = lookup(initial_lifecycle_hook.value, "default_result", null)
+    }
+  }
+
+  dynamic "warm_pool" {
+    for_each = lookup(var.worker_groups[count.index], "warm_pool", null) != null ? [lookup(var.worker_groups[count.index], "warm_pool")] : []
+
+    content {
+      pool_state                  = lookup(warm_pool.value, "pool_state", null)
+      min_size                    = lookup(warm_pool.value, "min_size", null)
+      max_group_prepared_capacity = lookup(warm_pool.value, "max_group_prepared_capacity", null)
     }
   }
 
@@ -126,7 +145,15 @@ resource "aws_autoscaling_group" "workers" {
           "propagate_at_launch" = true
         },
       ],
-      local.asg_tags,
+      [
+        for tag_key, tag_value in var.tags :
+        {
+          "key"                 = tag_key,
+          "value"               = tag_value,
+          "propagate_at_launch" = "true"
+        }
+        if tag_key != "Name" && !contains([for tag in lookup(var.worker_groups[count.index], "tags", local.workers_group_defaults["tags"]) : tag["key"]], tag_key)
+      ],
       lookup(
         var.worker_groups[count.index],
         "tags",
@@ -137,6 +164,33 @@ resource "aws_autoscaling_group" "workers" {
       key                 = tag.value.key
       value               = tag.value.value
       propagate_at_launch = tag.value.propagate_at_launch
+    }
+  }
+
+  # logic duplicated in workers_launch_template.tf
+  dynamic "instance_refresh" {
+    for_each = lookup(var.worker_groups[count.index],
+      "instance_refresh_enabled",
+    local.workers_group_defaults["instance_refresh_enabled"]) ? [1] : []
+    content {
+      strategy = lookup(
+        var.worker_groups[count.index], "instance_refresh_strategy",
+        local.workers_group_defaults["instance_refresh_strategy"]
+      )
+      preferences {
+        instance_warmup = lookup(
+          var.worker_groups[count.index], "instance_refresh_instance_warmup",
+          local.workers_group_defaults["instance_refresh_instance_warmup"]
+        )
+        min_healthy_percentage = lookup(
+          var.worker_groups[count.index], "instance_refresh_min_healthy_percentage",
+          local.workers_group_defaults["instance_refresh_min_healthy_percentage"]
+        )
+      }
+      triggers = lookup(
+        var.worker_groups[count.index], "instance_refresh_triggers",
+        local.workers_group_defaults["instance_refresh_triggers"]
+      )
     }
   }
 
@@ -182,11 +236,11 @@ resource "aws_launch_configuration" "workers" {
     "key_name",
     local.workers_group_defaults["key_name"],
   )
-  user_data_base64 = base64encode(data.template_file.userdata.*.rendered[count.index])
+  user_data_base64 = base64encode(local.userdata_rendered[count.index])
   ebs_optimized = lookup(
     var.worker_groups[count.index],
     "ebs_optimized",
-    ! contains(
+    !contains(
       local.ebs_optimized_not_supported,
       lookup(
         var.worker_groups[count.index],
@@ -210,6 +264,24 @@ resource "aws_launch_configuration" "workers" {
     "placement_tenancy",
     local.workers_group_defaults["placement_tenancy"],
   )
+
+  metadata_options {
+    http_endpoint = lookup(
+      var.worker_groups[count.index],
+      "metadata_http_endpoint",
+      local.workers_group_defaults["metadata_http_endpoint"],
+    )
+    http_tokens = lookup(
+      var.worker_groups[count.index],
+      "metadata_http_tokens",
+      local.workers_group_defaults["metadata_http_tokens"],
+    )
+    http_put_response_hop_limit = lookup(
+      var.worker_groups[count.index],
+      "metadata_http_put_response_hop_limit",
+      local.workers_group_defaults["metadata_http_put_response_hop_limit"],
+    )
+  }
 
   root_block_device {
     encrypted = lookup(
@@ -285,21 +357,6 @@ resource "aws_launch_configuration" "workers" {
   ]
 }
 
-resource "random_pet" "workers" {
-  count = var.create_eks ? local.worker_group_count : 0
-
-  separator = "-"
-  length    = 2
-
-  keepers = {
-    lc_name = aws_launch_configuration.workers[count.index].name
-  }
-
-  lifecycle {
-    create_before_destroy = true
-  }
-}
-
 resource "aws_security_group" "workers" {
   count       = var.worker_create_security_group && var.create_eks ? 1 : 0
   name_prefix = var.cluster_name
@@ -319,7 +376,7 @@ resource "aws_security_group_rule" "workers_egress_internet" {
   description       = "Allow nodes all egress to the Internet."
   protocol          = "-1"
   security_group_id = local.worker_security_group_id
-  cidr_blocks       = ["0.0.0.0/0"]
+  cidr_blocks       = var.workers_egress_cidrs
   from_port         = 0
   to_port           = 0
   type              = "egress"
@@ -412,6 +469,7 @@ resource "aws_iam_instance_profile" "workers" {
   )
 
   path = var.iam_path
+  tags = var.tags
 
   lifecycle {
     create_before_destroy = true
